@@ -2,6 +2,9 @@
 
 一鍵把 Xcode Preview 截圖套上 iPhone bezel 外框,並複製到剪貼簿。
 
+<img src="example.png" width="320" alt="範例:SwiftUI preview 套上 iPhone 17 Pro 宇宙橙外框">
+
+
 按下 Xcode 裡綁定的快捷鍵(例如 ⌘P),就會自動:
 
 1. 觸發 Xcode 選單 **Editor ▸ Canvas ▸ Copy Preview Screenshot**,取得乾淨的 preview 渲染圖(無狀態列、Dynamic Island 為黑色藥丸)
