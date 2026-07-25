@@ -22,7 +22,9 @@
 
 ## 更換 bezel
 
-把 `bezel.png` 換成任何「螢幕區域為透明」的裝置外框圖即可,程式會自動偵測透明區域的位置與大小,不需要改程式碼。目前附的是 iPhone 17 Pro(宇宙橙),螢幕挖洞剛好是 1206×2622,與 preview 截圖 1:1。
+把 `bezel.png` 換成任何「螢幕區域為透明」的裝置外框圖即可,程式會自動偵測透明區域的位置與大小,不需要改程式碼。
+
+目前附的 `bezel.png` 是 **iPhone 17 Pro(宇宙橙)**,來自 [Apple Design Resources](https://developer.apple.com/design/resources/) 的產品外框素材,螢幕挖洞剛好是 1206×2622,與 preview 截圖 1:1。使用時請遵守 Apple Design Resources 的授權條款。
 
 ## 運作原理
 
