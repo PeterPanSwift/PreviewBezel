@@ -22,6 +22,13 @@
 
 > MCP 來源的快照解析度由 Xcode 決定,可能低於裝置原生解析度(合成時會放大);若在意畫質,可關閉 Xcode Tools 讓工具改走選單方案,取得原生 3x 解析度的截圖。
 
+### 關於「Allow "preview-bezel" to access Xcode?」授權視窗
+
+正式版 Xcode 對每次新啟動的 agent 連線都會跳授權視窗,沒有「永久允許」機制。本工具做了兩層處理:
+
+1. 編譯後自動用 Apple Development 憑證重簽 binary(可用 `PREVIEW_BEZEL_SIGN_ID` 指定憑證),讓簽章身分穩定
+2. 執行時背景偵測授權視窗,確認內容包含本工具路徑後**自動點擊 Allow**(只點自己的,不會誤點其他 agent 的授權視窗;需要輔助使用權限)
+
 ## 使用
 
 1. 在 Xcode 打開 SwiftUI 檔案,讓 Canvas preview 跑起來
