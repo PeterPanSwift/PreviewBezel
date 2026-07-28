@@ -297,16 +297,19 @@ guard FileManager.default.fileExists(atPath: bezelPath) else {
     fail("找不到 bezel 圖：\(bezelPath)")
 }
 
-// MARK: - 取得截圖（MCP 優先，選單備援）
+// MARK: - 取得截圖（選單優先，MCP 備援）
+// 選單的 Copy Preview Screenshot 擷取「Canvas 目前顯示的畫面」（含互動後的狀態），
+// 且為原生 3x 解析度；MCP 的 RenderPreview 則是重新建置並渲染 #Preview 的初始狀態，
+// 不會反映 Canvas 互動現況、解析度也較低，所以只當備援。
 
-var shotSource = "MCP"
-var shotOpt = captureViaMCP()
+var shotSource = "選單"
+var shotOpt = captureViaMenu()
 if shotOpt == nil {
-    shotSource = "選單"
-    shotOpt = captureViaMenu()
+    shotSource = "MCP"
+    shotOpt = captureViaMCP()
 }
 guard let shot = shotOpt else {
-    fail("兩種方案都無法取得 preview 截圖。MCP：請確認 Xcode ▸ Settings ▸ Intelligence 已啟用 Xcode Tools；選單：請確認已授權輔助使用權限，且 Canvas 的 preview 有畫面")
+    fail("兩種方案都無法取得 preview 截圖。選單：請確認已授權輔助使用權限，且 Canvas 的 preview 有畫面；MCP：請確認 Xcode ▸ Settings ▸ Intelligence 已啟用 Xcode Tools")
 }
 
 guard let bezel = loadCGImage(bezelPath) else { fail("bezel 圖讀取失敗") }
