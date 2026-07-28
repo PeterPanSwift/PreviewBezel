@@ -18,6 +18,13 @@ if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
     /usr/bin/osascript -e 'display notification "編譯失敗，詳見 .build/compile.log" with title "Preview Bezel"'
     exit 1
   fi
+  # swiftc 產出的是 ad-hoc 簽名，Xcode 無法記住 MCP 授權、每次都會重新詢問；
+  # 改用鑰匙圈裡的 Apple Development 憑證重簽（可用 PREVIEW_BEZEL_SIGN_ID 覆寫），
+  # 簽章身分穩定後只需授權一次。
+  SIGN_ID="${PREVIEW_BEZEL_SIGN_ID:-$(/usr/bin/security find-identity -v -p codesigning | /usr/bin/awk -F'"' '/Apple Development/{print $2; exit}')}"
+  if [[ -n "$SIGN_ID" ]]; then
+    /usr/bin/codesign --force --sign "$SIGN_ID" --identifier preview-bezel "$BIN" 2>>"$BUILD_DIR/compile.log" || true
+  fi
 fi
 
 exec "$BIN" "$BEZEL" "$OUT"
