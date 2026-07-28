@@ -1,9 +1,14 @@
 // PreviewBezel.swift
-// 透過 Xcode 選單 Editor ▸ Canvas ▸ Copy Preview Screenshot 取得 preview 截圖
-// → 套上 bezel → 複製到剪貼簿
+// 取得 Xcode Preview 截圖 → 套上 bezel → 複製到剪貼簿
 // 用法: preview-bezel <bezel.png> <output.png>
+//
+// 截圖來源（依序嘗試）：
+// 1. Xcode 官方 MCP server（xcrun mcpbridge）的 RenderPreview 工具
+//    — 需在 Xcode ▸ Settings ▸ Intelligence 啟用「Xcode Tools」
+// 2. AppleScript 點擊 Editor ▸ Canvas ▸ Copy Preview Screenshot
+//    — 需要「輔助使用」（Accessibility）權限
+//
 // bezel.png 的螢幕區域必須是透明的；程式會自動偵測透明區域的位置與大小。
-// 注意：點擊 Xcode 選單需要「輔助使用」（Accessibility）權限。
 
 import AppKit
 import ImageIO
@@ -44,17 +49,127 @@ func loadCGImage(_ path: String) -> CGImage? {
     return CGImageSourceCreateImageAtIndex(src, 0, nil)
 }
 
-// MARK: - 參數
+// MARK: - Xcode MCP client（JSON-RPC over stdio，line-delimited）
 
-let args = CommandLine.arguments
-guard args.count >= 3 else { fail("用法: preview-bezel <bezel.png> <output.png>") }
-let bezelPath = args[1]
-let outputPath = args[2]
-guard FileManager.default.fileExists(atPath: bezelPath) else {
-    fail("找不到 bezel 圖：\(bezelPath)")
+final class MCPBridge {
+    private let proc = Process()
+    private let inputPipe = Pipe()
+    private let outputPipe = Pipe()
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var replies: [Int: [String: Any]] = [:]
+    private var nextID = 1
+
+    func start() -> Bool {
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        proc.arguments = ["mcpbridge"]
+        proc.standardInput = inputPipe
+        proc.standardOutput = outputPipe
+        proc.standardError = Pipe()
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] fh in
+            let data = fh.availableData
+            guard let self, !data.isEmpty else { return }
+            self.lock.lock()
+            self.buffer.append(data)
+            self.drainLocked()
+            self.lock.unlock()
+        }
+        do { try proc.run() } catch { return false }
+        return true
+    }
+
+    func stop() {
+        outputPipe.fileHandleForReading.readabilityHandler = nil
+        if proc.isRunning { proc.terminate() }
+    }
+
+    // 把 buffer 裡完整的行解析成 JSON 回應（呼叫前須持有 lock）
+    private func drainLocked() {
+        while let nl = buffer.range(of: Data([0x0A])) {
+            let line = buffer.subdata(in: buffer.startIndex..<nl.lowerBound)
+            buffer.removeSubrange(buffer.startIndex..<nl.upperBound)
+            guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                  let id = obj["id"] as? Int else { continue }
+            replies[id] = obj
+        }
+    }
+
+    private func send(_ obj: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        inputPipe.fileHandleForWriting.write(data + Data([0x0A]))
+    }
+
+    func sendNotification(_ method: String) {
+        send(["jsonrpc": "2.0", "method": method])
+    }
+
+    func request(_ method: String, _ params: [String: Any], timeout: TimeInterval) -> [String: Any]? {
+        let id = nextID; nextID += 1
+        send(["jsonrpc": "2.0", "id": id, "method": method, "params": params])
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while Date() < deadline {
+            lock.lock()
+            let msg = replies.removeValue(forKey: id)
+            lock.unlock()
+            if let msg { return msg["result"] as? [String: Any] }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return nil
+    }
+
+    // 回傳 tools/call 的 structuredContent（工具錯誤時該欄位會缺少預期的 key）
+    func callTool(_ name: String, _ arguments: [String: Any], timeout: TimeInterval) -> [String: Any]? {
+        guard let result = request("tools/call", ["name": name, "arguments": arguments],
+                                   timeout: timeout) else { return nil }
+        return result["structuredContent"] as? [String: Any]
+    }
 }
 
-// MARK: - 觸發 Xcode 的 Copy Preview Screenshot，從剪貼簿取得截圖
+// MARK: - 截圖來源 1：MCP RenderPreview
+
+func captureViaMCP() -> CGImage? {
+    let bridge = MCPBridge()
+    guard bridge.start() else { return nil }
+    defer { bridge.stop() }
+
+    guard bridge.request("initialize", [
+        "protocolVersion": "2025-06-18",
+        "capabilities": [String: Any](),
+        "clientInfo": ["name": "preview-bezel", "version": "1.0"],
+    ], timeout: 15) != nil else { return nil }
+    bridge.sendNotification("notifications/initialized")
+
+    // 沒啟用 Xcode Tools 時，tools/call 不會回應，靠 timeout 走備援
+    guard let windows = bridge.callTool("XcodeListWindows", [:], timeout: 30),
+          let message = windows["message"] as? String else { return nil }
+
+    // 訊息格式：「* tabIdentifier: windowtab5, workspacePath: /path/to/App.xcodeproj」（每視窗一行）
+    var tabs: [String] = []
+    var rest = Substring(message)
+    while let r = rest.range(of: "tabIdentifier: ") {
+        let after = rest[r.upperBound...]
+        let tab = after.prefix(while: { $0 != "," && $0 != " " && !$0.isNewline })
+        if !tab.isEmpty { tabs.append(String(tab)) }
+        rest = after
+    }
+
+    // 逐一嘗試每個視窗：目前檔案是 .swift 就渲染它的第一個 #Preview
+    for tab in tabs {
+        guard let current = bridge.callTool("XcodeGetCurrentFile",
+                ["tabIdentifier": tab, "includeContent": false, "includeSelection": false],
+                timeout: 30),
+              let filePath = current["filePath"] as? String,
+              filePath.hasSuffix(".swift") else { continue }
+        guard let render = bridge.callTool("RenderPreview",
+                ["sourceFilePath": filePath, "tabIdentifier": tab], timeout: 180),
+              let snapshotPath = render["previewSnapshotPath"] as? String,
+              let image = loadCGImage(snapshotPath) else { continue }
+        return image
+    }
+    return nil
+}
+
+// MARK: - 截圖來源 2：點擊 Xcode 選單 Copy Preview Screenshot
 
 // Editor 選單有兩個「Canvas」項目（顯示開關與子選單）。同名引用會解析到
 // 開關那個，而且把 menu item 存進變數時 AppleScript 會把索引改寫成名稱引用
@@ -90,27 +205,45 @@ tell application "System Events"
 end tell
 """
 
-let pb = NSPasteboard.general
-let baseline = pb.changeCount
-let (clickStatus, _) = run(["/usr/bin/osascript", "-e", clickScript])
-guard clickStatus == 0 else {
-    fail("無法點擊 Editor ▸ Canvas ▸ Copy Preview Screenshot；請確認 Canvas 開著、preview 正在執行，且已授權輔助使用權限")
+func captureViaMenu() -> CGImage? {
+    let pb = NSPasteboard.general
+    let baseline = pb.changeCount
+    let (clickStatus, _) = run(["/usr/bin/osascript", "-e", clickScript])
+    guard clickStatus == 0 else { return nil }
+
+    // 等 Xcode 把截圖放進剪貼簿（最多 15 秒）
+    for _ in 0..<75 {
+        if pb.changeCount != baseline,
+           let data = pb.data(forType: .png) ?? pb.data(forType: .tiff),
+           let src = CGImageSourceCreateWithData(data as CFData, nil),
+           let img = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            return img
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+    return nil
 }
 
-// 等 Xcode 把截圖放進剪貼簿（最多 15 秒）
-var shotOpt: CGImage?
-for _ in 0..<75 {
-    if pb.changeCount != baseline,
-       let data = pb.data(forType: .png) ?? pb.data(forType: .tiff),
-       let src = CGImageSourceCreateWithData(data as CFData, nil),
-       let img = CGImageSourceCreateImageAtIndex(src, 0, nil) {
-        shotOpt = img
-        break
-    }
-    Thread.sleep(forTimeInterval: 0.2)
+// MARK: - 參數
+
+let args = CommandLine.arguments
+guard args.count >= 3 else { fail("用法: preview-bezel <bezel.png> <output.png>") }
+let bezelPath = args[1]
+let outputPath = args[2]
+guard FileManager.default.fileExists(atPath: bezelPath) else {
+    fail("找不到 bezel 圖：\(bezelPath)")
+}
+
+// MARK: - 取得截圖（MCP 優先，選單備援）
+
+var shotSource = "MCP"
+var shotOpt = captureViaMCP()
+if shotOpt == nil {
+    shotSource = "選單"
+    shotOpt = captureViaMenu()
 }
 guard let shot = shotOpt else {
-    fail("等不到剪貼簿出現 preview 截圖，請確認 Canvas 的 preview 有畫面")
+    fail("兩種方案都無法取得 preview 截圖。MCP：請確認 Xcode ▸ Settings ▸ Intelligence 已啟用 Xcode Tools；選單：請確認已授權輔助使用權限，且 Canvas 的 preview 有畫面")
 }
 
 guard let bezel = loadCGImage(bezelPath) else { fail("bezel 圖讀取失敗") }
@@ -234,10 +367,11 @@ guard CGImageDestinationFinalize(dest), let pngData = try? Data(contentsOf: outU
     fail("PNG 輸出失敗")
 }
 
+let pb = NSPasteboard.general
 pb.clearContents()
 pb.setData(pngData, forType: .png)
 if let tiff = NSImage(data: pngData)?.tiffRepresentation {
     pb.setData(tiff, forType: .tiff)
 }
 
-notify("✅ 已合成並複製到剪貼簿")
+notify("✅ 已合成並複製到剪貼簿（來源：\(shotSource)）")
