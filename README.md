@@ -4,7 +4,8 @@ One keystroke to wrap your Xcode Preview screenshot in an iPhone bezel and copy 
 
 [English](#english) | [繁體中文](#繁體中文)
 
-<img src="example.png" width="320" alt="Example: SwiftUI preview wrapped in an iPhone 18 Pro Glacier bezel">
+<img src="example.png" width="240" alt="Example: SwiftUI preview wrapped in an iPhone 18 Pro Glacier bezel">
+<img src="example-duo.png" width="500" alt="Example: SwiftUI preview wrapped in an unfolded iPhone Duo bezel">
 
 ## English
 
