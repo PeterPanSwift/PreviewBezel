@@ -1,6 +1,6 @@
 // PreviewBezel.swift
 // 取得 Xcode Preview 截圖 → 套上 bezel → 複製到剪貼簿
-// 用法: preview-bezel <bezel.png> <output.png>
+// 用法: preview-bezel <output.png> <bezel.png> [更多 bezel.png ...]
 //
 // 截圖來源（依序嘗試）：
 // 1. Xcode 官方 MCP server（xcrun mcpbridge）的 RenderPreview 工具
@@ -8,7 +8,8 @@
 // 2. AppleScript 點擊 Editor ▸ Canvas ▸ Copy Preview Screenshot
 //    — 需要「輔助使用」（Accessibility）權限
 //
-// bezel.png 的螢幕區域必須是透明的；程式會自動偵測透明區域的位置與大小。
+// bezel 圖的螢幕區域必須是透明的；程式會自動偵測透明區域的位置與大小。
+// 給多張 bezel 時，挑「螢幕長寬比最接近截圖」的那張（例如 iPhone Duo 的內螢幕 vs. 一般 iPhone）。
 
 import AppKit
 import ImageIO
@@ -287,15 +288,92 @@ func captureViaMenu() -> CGImage? {
     return nil
 }
 
+// MARK: - bezel 分析：找出螢幕（透明）區域
+
+// 螢幕不一定在圖片正中央——摺疊機的 bezel 是「背面 ＋ 內螢幕」的攤開圖，螢幕只佔右半邊。
+// 所以先從影像四邊 flood fill 透明像素，標出「手機輪廓以外」；剩下的透明像素就是螢幕
+// 挖空處，取其中最大的連通區塊，外接矩形即螢幕範圍。
+// （Dynamic Island／鏡頭挖孔是螢幕裡的不透明小島，被透明區包住，不影響外接矩形。）
+struct Bezel {
+    let path: String
+    let image: CGImage
+    let screenRect: CGRect  // CG 座標（原點在左下）
+    let outside: [Bool]     // row-major、第 0 列為最上緣；true = 手機輪廓以外的透明像素
+    var name: String { (path as NSString).lastPathComponent }
+    var aspect: CGFloat { screenRect.width / screenRect.height }
+}
+
+func analyzeBezel(_ path: String) -> Bezel? {
+    guard let image = loadCGImage(path) else { return nil }
+    let W = image.width, H = image.height
+    let space = CGColorSpace(name: CGColorSpace.sRGB)!
+    guard let probe = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8,
+                                bytesPerRow: W * 4, space: space,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    probe.draw(image, in: CGRect(x: 0, y: 0, width: W, height: H))
+    guard let bufRaw = probe.data else { return nil }
+    let buf = bufRaw.bindMemory(to: UInt8.self, capacity: W * H * 4)
+
+    // buffer 第 0 列 = 圖片最上緣；y 以左上角為原點
+    let clearT: UInt8 = 16  // alpha 低於此值視為透明
+    func isClear(_ x: Int, _ y: Int) -> Bool { buf[(y * W + x) * 4 + 3] < clearT }
+
+    var stack = [Int]()
+
+    // 1. 從四邊往內 flood fill 透明像素 → 手機輪廓以外的區域
+    //    （合成後用它把 aspect-fill 溢出、又落在輪廓外的像素清掉）
+    var outside = [Bool](repeating: false, count: W * H)
+    func seed(_ x: Int, _ y: Int) {
+        let i = y * W + x
+        if !outside[i] && isClear(x, y) { outside[i] = true; stack.append(i) }
+    }
+    for x in 0..<W { seed(x, 0); seed(x, H - 1) }
+    for y in 0..<H { seed(0, y); seed(W - 1, y) }
+    while let idx = stack.popLast() {
+        let x = idx % W, y = idx / W
+        for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+            guard nx >= 0, nx < W, ny >= 0, ny < H else { continue }
+            let n = ny * W + nx
+            if !outside[n] && isClear(nx, ny) { outside[n] = true; stack.append(n) }
+        }
+    }
+
+    // 2. 剩下的透明像素＝螢幕挖空處；取最大連通區塊
+    var seen = outside
+    var best = (count: 0, minX: 0, minY: 0, maxX: 0, maxY: 0)
+    for sy in 0..<H {
+        for sx in 0..<W where !seen[sy * W + sx] && isClear(sx, sy) {
+            seen[sy * W + sx] = true
+            stack.append(sy * W + sx)
+            var cur = (count: 0, minX: sx, minY: sy, maxX: sx, maxY: sy)
+            while let idx = stack.popLast() {
+                let x = idx % W, y = idx / W
+                cur.count += 1
+                cur.minX = min(cur.minX, x); cur.maxX = max(cur.maxX, x)
+                cur.minY = min(cur.minY, y); cur.maxY = max(cur.maxY, y)
+                for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
+                    guard nx >= 0, nx < W, ny >= 0, ny < H else { continue }
+                    let n = ny * W + nx
+                    if !seen[n] && isClear(nx, ny) { seen[n] = true; stack.append(n) }
+                }
+            }
+            if cur.count > best.count { best = cur }
+        }
+    }
+    guard best.count > 0 else { return nil }
+
+    let screenRect = CGRect(x: CGFloat(best.minX), y: CGFloat(H - 1 - best.maxY),
+                            width: CGFloat(best.maxX - best.minX + 1),
+                            height: CGFloat(best.maxY - best.minY + 1))
+    return Bezel(path: path, image: image, screenRect: screenRect, outside: outside)
+}
+
 // MARK: - 參數
 
 let args = CommandLine.arguments
-guard args.count >= 3 else { fail("用法: preview-bezel <bezel.png> <output.png>") }
-let bezelPath = args[1]
-let outputPath = args[2]
-guard FileManager.default.fileExists(atPath: bezelPath) else {
-    fail("找不到 bezel 圖：\(bezelPath)")
-}
+guard args.count >= 3 else { fail("用法: preview-bezel <output.png> <bezel.png> [更多 bezel.png ...]") }
+let outputPath = args[1]
+let bezelPaths = Array(args.dropFirst(2))
 
 // MARK: - 取得截圖（選單優先，MCP 備援）
 // 選單的 Copy Preview Screenshot 擷取「Canvas 目前顯示的畫面」（含互動後的狀態），
@@ -312,86 +390,22 @@ guard let shot = shotOpt else {
     fail("兩種方案都無法取得 preview 截圖。選單：請確認已授權輔助使用權限，且 Canvas 的 preview 有畫面；MCP：請確認 Xcode ▸ Settings ▸ Intelligence 已啟用 Xcode Tools")
 }
 
-guard let bezel = loadCGImage(bezelPath) else { fail("bezel 圖讀取失敗") }
+// MARK: - 挑 bezel：螢幕長寬比最接近截圖的那個
+// 截圖尺寸就代表裝置：iPhone Duo 的內螢幕比一般 iPhone 方，兩者長寬比差很遠，
+// 直接比長寬比即可對號入座（放新的 bezel 進來也自動生效，不必改程式）。
 
-// MARK: - 偵測 bezel 的螢幕（透明）區域
-
-let W = bezel.width, H = bezel.height
-let space = CGColorSpace(name: CGColorSpace.sRGB)!
-guard let probe = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8,
-                            bytesPerRow: W * 4, space: space,
-                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
-    fail("bezel 圖解析失敗")
+let bezels = bezelPaths.compactMap(analyzeBezel)
+guard !bezels.isEmpty else {
+    fail("沒有可用的 bezel 圖（螢幕區域必須是透明的）：\(bezelPaths.joined(separator: ", "))")
 }
-probe.draw(bezel, in: CGRect(x: 0, y: 0, width: W, height: H))
-guard let bufRaw = probe.data else { fail("bezel 圖解析失敗") }
-let buf = bufRaw.bindMemory(to: UInt8.self, capacity: W * H * 4)
-
-// buffer 第 0 列 = 圖片最上緣；y 以左上角為原點
-func alphaAt(_ x: Int, _ y: Int) -> UInt8 { buf[(y * W + x) * 4 + 3] }
-let clearT: UInt8 = 16  // alpha 低於此值視為透明
-
-let cx = W / 2, cy = H / 2
-guard alphaAt(cx, cy) < clearT else {
-    fail("bezel 圖中央必須是透明的螢幕區域（目前是不透明像素）")
-}
-
-// 水平範圍：從中心列往左右走到不透明為止（取多列的最大範圍）
-var left = cx, right = cx
-for row in [cy - H / 20, cy, cy + H / 20] {
-    var l = cx, r = cx
-    while l > 0 && alphaAt(l - 1, row) < clearT { l -= 1 }
-    while r < W - 1 && alphaAt(r + 1, row) < clearT { r += 1 }
-    left = min(left, l); right = max(right, r)
-}
-
-// 垂直範圍：避開中央的 Dynamic Island 與圓角，
-// 在螢幕寬度 18%–25% 的幾個直欄上往上下走（取最大範圍）
-let span = right - left + 1
-var top = cy, bottom = cy
-for frac in [0.18, 0.22, 0.78, 0.82] {
-    let x = left + Int(Double(span) * frac)
-    var t = cy, b = cy
-    while t > 0 && alphaAt(x, t - 1) < clearT { t -= 1 }
-    while b < H - 1 && alphaAt(x, b + 1) < clearT { b += 1 }
-    top = min(top, t); bottom = max(bottom, b)
-}
-
-// 轉成 CG 座標（原點在左下）
-let screenRect = CGRect(x: CGFloat(left), y: CGFloat(H - 1 - bottom),
-                        width: CGFloat(span), height: CGFloat(bottom - top + 1))
-
-// screenRect 只是外接矩形；螢幕有圓角，矩形四個角落會落在手機外框輪廓之外。
-// 從影像邊界 flood fill 透明像素，找出「外框輪廓以外」的區域，合成後把溢出清掉。
-// （螢幕內緣的半透明陰影不受影響，內容照樣墊在下面，不會產生黑邊。）
-var outside = [Bool](repeating: false, count: W * H)
-var stack = [Int]()
-for x in 0..<W {
-    for y in [0, H - 1] where alphaAt(x, y) < clearT {
-        let i = y * W + x
-        if !outside[i] { outside[i] = true; stack.append(i) }
-    }
-}
-for y in 0..<H {
-    for x in [0, W - 1] where alphaAt(x, y) < clearT {
-        let i = y * W + x
-        if !outside[i] { outside[i] = true; stack.append(i) }
-    }
-}
-while let idx = stack.popLast() {
-    let x = idx % W, y = idx / W
-    for (nx, ny) in [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)] {
-        guard nx >= 0, nx < W, ny >= 0, ny < H else { continue }
-        let n = ny * W + nx
-        if !outside[n] && alphaAt(nx, ny) < clearT {
-            outside[n] = true
-            stack.append(n)
-        }
-    }
-}
+let shotAspect = CGFloat(shot.width) / CGFloat(shot.height)
+let bezel = bezels.min { abs($0.aspect - shotAspect) < abs($1.aspect - shotAspect) }!
 
 // MARK: - 合成
 
+let W = bezel.image.width, H = bezel.image.height
+let screenRect = bezel.screenRect
+let space = CGColorSpace(name: CGColorSpace.sRGB)!
 guard let canvas = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8,
                              bytesPerRow: W * 4, space: space,
                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
@@ -413,12 +427,12 @@ canvas.restoreGState()
 // 清掉溢出到外框輪廓以外的截圖像素（canvas buffer 第 0 列 = 最上緣，與 outside 索引一致）
 if let canvasRaw = canvas.data {
     let px = canvasRaw.bindMemory(to: UInt8.self, capacity: W * H * 4)
-    for i in 0..<(W * H) where outside[i] {
+    for i in 0..<(W * H) where bezel.outside[i] {
         px[i * 4] = 0; px[i * 4 + 1] = 0; px[i * 4 + 2] = 0; px[i * 4 + 3] = 0
     }
 }
 
-canvas.draw(bezel, in: CGRect(x: 0, y: 0, width: W, height: H))
+canvas.draw(bezel.image, in: CGRect(x: 0, y: 0, width: W, height: H))
 
 guard let composed = canvas.makeImage() else { fail("合成失敗") }
 
@@ -440,4 +454,4 @@ if let tiff = NSImage(data: pngData)?.tiffRepresentation {
     pb.setData(tiff, forType: .tiff)
 }
 
-notify("✅ 已合成並複製到剪貼簿（來源：\(shotSource)）")
+notify("✅ 已合成並複製到剪貼簿（來源：\(shotSource)、外框：\(bezel.name)）")

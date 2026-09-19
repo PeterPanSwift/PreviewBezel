@@ -5,7 +5,6 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 SRC="$SCRIPT_DIR/PreviewBezel.swift"
-BEZEL="$SCRIPT_DIR/bezel.png"
 BUILD_DIR="$SCRIPT_DIR/.build"
 BIN="$BUILD_DIR/preview-bezel"
 OUT="$BUILD_DIR/last-output.png"
@@ -27,4 +26,5 @@ if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
   fi
 fi
 
-exec "$BIN" "$BEZEL" "$OUT"
+# 傳入所有 bezel*.png，程式挑螢幕長寬比最接近截圖的那張
+exec "$BIN" "$OUT" "$SCRIPT_DIR"/bezel*.png
