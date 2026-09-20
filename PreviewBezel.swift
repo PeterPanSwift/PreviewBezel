@@ -9,7 +9,7 @@
 //    — 需要「輔助使用」（Accessibility）權限
 //
 // bezel 圖的螢幕區域必須是透明的；程式會自動偵測透明區域的位置與大小。
-// 給多張 bezel 時，挑「螢幕長寬比最接近截圖」的那張（例如 iPhone Duo 的內螢幕 vs. 一般 iPhone）。
+// 依螢幕長寬比辨識裝置；iPhone Duo 會先顯示外框選擇視窗。
 
 import AppKit
 import ImageIO
@@ -290,7 +290,7 @@ func captureViaMenu() -> CGImage? {
 
 // MARK: - bezel 分析：找出螢幕（透明）區域
 
-// 螢幕不一定在圖片正中央——摺疊機的 bezel 是「背面 ＋ 內螢幕」的攤開圖，螢幕只佔右半邊。
+// 螢幕不一定在圖片正中央——摺疊機的 bezel 是「背面 ＋ 外螢幕」的攤開圖，螢幕只佔右半邊。
 // 所以先從影像四邊 flood fill 透明像素，標出「手機輪廓以外」；剩下的透明像素就是螢幕
 // 挖空處，取其中最大的連通區塊，外接矩形即螢幕範圍。
 // （Dynamic Island／鏡頭挖孔是螢幕裡的不透明小島，被透明區包住，不影響外接矩形。）
@@ -301,6 +301,15 @@ struct Bezel {
     let outside: [Bool]     // row-major、第 0 列為最上緣；true = 手機輪廓以外的透明像素
     var name: String { (path as NSString).lastPathComponent }
     var aspect: CGFloat { screenRect.width / screenRect.height }
+    var isDuo: Bool { name == "bezel-duo.png" || name.hasPrefix("bezel-duo-") }
+    var displayName: String {
+        switch name {
+        case "bezel-duo.png": return "星白色・展開"
+        case "bezel-duo-star-white-closed.png": return "星白色・闔上直向"
+        case "bezel-duo-night-sky-open.png": return "夜空色・展開"
+        default: return name
+        }
+    }
 }
 
 func analyzeBezel(_ path: String) -> Bezel? {
@@ -368,6 +377,73 @@ func analyzeBezel(_ path: String) -> Bezel? {
     return Bezel(path: path, image: image, screenRect: screenRect, outside: outside)
 }
 
+// MARK: - iPhone Duo 外框選擇
+
+func bezelChoices(for shotAspect: CGFloat, from bezels: [Bezel]) -> [Bezel] {
+    guard let closest = bezels.min(by: { abs($0.aspect - shotAspect) < abs($1.aspect - shotAspect) }) else {
+        return []
+    }
+    guard closest.isDuo else { return [closest] }
+    // 同一裝置的顏色／開闔樣式都要列出，不能只留下比例最接近的一張。
+    let order = ["bezel-duo.png", "bezel-duo-star-white-closed.png", "bezel-duo-night-sky-open.png"]
+    return bezels.filter(\.isDuo).sorted {
+        let lhs = order.firstIndex(of: $0.name) ?? order.count
+        let rhs = order.firstIndex(of: $1.name) ?? order.count
+        return lhs == rhs ? $0.name < $1.name : lhs < rhs
+    }
+}
+
+final class BezelPicker: NSObject {
+    private(set) var selectedIndex = 0
+    private var buttons: [NSButton] = []
+
+    @objc private func selectBezel(_ sender: NSButton) {
+        selectedIndex = sender.tag
+        for button in buttons { button.state = button.tag == selectedIndex ? .on : .off }
+    }
+
+    func choose(from bezels: [Bezel]) -> Bezel? {
+        guard bezels.count > 1 else { return bezels.first }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let alert = NSAlert()
+        alert.messageText = "選擇 iPhone Duo 外框"
+        alert.informativeText = "已偵測到 iPhone Duo，請選擇要套用的外框。"
+        alert.addButton(withTitle: "套用外框")
+        alert.addButton(withTitle: "取消")
+
+        selectedIndex = 0
+        buttons = []
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 16
+        for (index, bezel) in bezels.enumerated() {
+            let preview = NSImageView()
+            preview.image = NSImage(cgImage: bezel.image, size: .zero)
+            preview.imageScaling = .scaleProportionallyUpOrDown
+            preview.setAccessibilityLabel(bezel.displayName)
+            preview.widthAnchor.constraint(equalToConstant: 180).isActive = true
+            preview.heightAnchor.constraint(equalToConstant: 190).isActive = true
+            let button = NSButton(radioButtonWithTitle: bezel.displayName,
+                                  target: self, action: #selector(selectBezel(_:)))
+            button.tag = index
+            button.state = index == selectedIndex ? .on : .off
+            buttons.append(button)
+            let column = NSStackView(views: [preview, button])
+            column.orientation = .vertical
+            column.alignment = .centerX
+            column.spacing = 10
+            row.addArrangedSubview(column)
+        }
+        row.setFrameSize(row.fittingSize)
+        alert.accessoryView = row
+        app.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return bezels[selectedIndex]
+    }
+}
+
 // MARK: - 參數
 
 let args = CommandLine.arguments
@@ -390,16 +466,15 @@ guard let shot = shotOpt else {
     fail("兩種方案都無法取得 preview 截圖。選單：請確認已授權輔助使用權限，且 Canvas 的 preview 有畫面；MCP：請確認 Xcode ▸ Settings ▸ Intelligence 已啟用 Xcode Tools")
 }
 
-// MARK: - 挑 bezel：螢幕長寬比最接近截圖的那個
-// 截圖尺寸就代表裝置：iPhone Duo 的內螢幕比一般 iPhone 方，兩者長寬比差很遠，
-// 直接比長寬比即可對號入座（放新的 bezel 進來也自動生效，不必改程式）。
+// MARK: - 依比例辨識裝置，再選擇外框
 
 let bezels = bezelPaths.compactMap(analyzeBezel)
 guard !bezels.isEmpty else {
     fail("沒有可用的 bezel 圖（螢幕區域必須是透明的）：\(bezelPaths.joined(separator: ", "))")
 }
 let shotAspect = CGFloat(shot.width) / CGFloat(shot.height)
-let bezel = bezels.min { abs($0.aspect - shotAspect) < abs($1.aspect - shotAspect) }!
+let choices = bezelChoices(for: shotAspect, from: bezels)
+guard let bezel = BezelPicker().choose(from: choices) else { exit(0) }
 
 // MARK: - 合成
 

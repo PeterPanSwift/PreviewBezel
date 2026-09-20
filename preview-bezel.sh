@@ -26,5 +26,5 @@ if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
   fi
 fi
 
-# 傳入所有 bezel*.png，程式挑螢幕長寬比最接近截圖的那張
+# 傳入所有 bezel*.png，程式依比例辨識裝置；iPhone Duo 會顯示外框選擇視窗
 exec "$BIN" "$OUT" "$SCRIPT_DIR"/bezel*.png
